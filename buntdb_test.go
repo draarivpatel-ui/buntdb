@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"os"
@@ -2956,5 +2957,59 @@ func TestIssue112(t *testing.T) {
 			return true
 		})
 		return err
+	})
+}
+
+func TestLoadMalformedCommands(t *testing.T) {
+	// Loading a malformed or crafted RESP stream should return an error
+	// rather than panicking or silently succeeding.
+	cases := []struct {
+		name string
+		aof  string
+	}{
+		{"one byte set command", "*3\r\n$1\r\nS\r\n$1\r\nk\r\n$1\r\nv\r\n"},
+		{"two byte del command", "*2\r\n$2\r\nDE\r\n$1\r\nk\r\n"},
+		{"empty command name", "*1\r\n$0\r\n\r\n"},
+		{"part size overflow", "*3\r\n$3\r\nset\r\n$9223372036854775808\r\n"},
+		{"command count overflow", "*9223372036854775808\r\n"},
+		{"part size too large", "*3\r\n$3\r\nset\r\n$4611686018427387904\r\n"},
+		{"unknown short command", "*1\r\n$2\r\nSE\r\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.Load(strings.NewReader(tc.aof)); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+	t.Run("truncated tail", func(t *testing.T) {
+		db, err := Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		err = db.Load(strings.NewReader("*3\r\n$3\r\nset\r\n$1\r\nk\r\n$3\r\nva"))
+		if err != io.ErrUnexpectedEOF {
+			t.Fatalf("expected %v, got %v", io.ErrUnexpectedEOF, err)
+		}
+	})
+	t.Run("valid commands", func(t *testing.T) {
+		db, err := Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		err = db.Load(strings.NewReader(
+			"*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n" +
+				"*2\r\n$3\r\ndel\r\n$1\r\nk\r\n" +
+				"*1\r\n$7\r\nflushdb\r\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
 	})
 }

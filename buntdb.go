@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -803,6 +804,32 @@ func renameFile(src, dest string) error {
 	return err
 }
 
+// parseRespNum parses the decimal count or size from a RESP line such as
+// "*3\r\n" or "$12\r\n". The line must include the trailing CRLF. Returns
+// ErrInvalid for malformed lines and numbers that overflow int.
+func parseRespNum(line []byte) (int, error) {
+	if len(line) == 4 && line[len(line)-2] == '\r' {
+		if line[1] < '0' || line[1] > '9' {
+			return 0, ErrInvalid
+		}
+		return int(line[1] - '0'), nil
+	}
+	if len(line) < 5 || line[len(line)-2] != '\r' {
+		return 0, ErrInvalid
+	}
+	var n int
+	for i := 1; i < len(line)-2; i++ {
+		if line[i] < '0' || line[i] > '9' {
+			return 0, ErrInvalid
+		}
+		if n > (math.MaxInt-9)/10 {
+			return 0, ErrInvalid
+		}
+		n = n*10 + int(line[i]-'0')
+	}
+	return n, nil
+}
+
 // readLoad reads from the reader and loads commands into the database.
 // modTime is the modified time of the reader, should be no greater than
 // the current time.Now().
@@ -814,7 +841,7 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		}
 	}()
 	totalSize := int64(0)
-	data := make([]byte, 4096)
+	data := make([]byte, 2)
 	parts := make([]string, 0, 8)
 	r := bufio.NewReader(rd)
 	for {
@@ -849,22 +876,9 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		cmdByteSize += int64(len(line))
 
 		// convert the string number to and int
-		var n int
-		if len(line) == 4 && line[len(line)-2] == '\r' {
-			if line[1] < '0' || line[1] > '9' {
-				return totalSize, ErrInvalid
-			}
-			n = int(line[1] - '0')
-		} else {
-			if len(line) < 5 || line[len(line)-2] != '\r' {
-				return totalSize, ErrInvalid
-			}
-			for i := 1; i < len(line)-2; i++ {
-				if line[i] < '0' || line[i] > '9' {
-					return totalSize, ErrInvalid
-				}
-				n = n*10 + int(line[i]-'0')
-			}
+		n, err := parseRespNum(line)
+		if err != nil {
+			return totalSize, err
 		}
 		// read each part of the command.
 		parts = parts[:0]
@@ -879,39 +893,25 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			}
 			cmdByteSize += int64(len(line))
 			// convert the string number to and int
-			var n int
-			if len(line) == 4 && line[len(line)-2] == '\r' {
-				if line[1] < '0' || line[1] > '9' {
-					return totalSize, ErrInvalid
-				}
-				n = int(line[1] - '0')
-			} else {
-				if len(line) < 5 || line[len(line)-2] != '\r' {
-					return totalSize, ErrInvalid
-				}
-				for i := 1; i < len(line)-2; i++ {
-					if line[i] < '0' || line[i] > '9' {
-						return totalSize, ErrInvalid
-					}
-					n = n*10 + int(line[i]-'0')
-				}
-			}
-			// resize the read buffer
-			if len(data) < n+2 {
-				dataln := len(data)
-				for dataln < n+2 {
-					dataln *= 2
-				}
-				data = make([]byte, dataln)
-			}
-			if _, err = io.ReadFull(r, data[:n+2]); err != nil {
+			n, err := parseRespNum(line)
+			if err != nil {
 				return totalSize, err
 			}
-			if data[n] != '\r' || data[n+1] != '\n' {
+			// read the part content into a string. The declared size may
+			// exceed the actual stream size, so the payload is read
+			// incrementally instead of pre-allocating n bytes.
+			var sb strings.Builder
+			if _, err = io.CopyN(&sb, r, int64(n)); err != nil {
+				return totalSize, err
+			}
+			if _, err = io.ReadFull(r, data[:2]); err != nil {
+				return totalSize, err
+			}
+			if data[0] != '\r' || data[1] != '\n' {
 				return totalSize, ErrInvalid
 			}
 			// copy string
-			parts = append(parts, string(data[:n]))
+			parts = append(parts, sb.String())
 			cmdByteSize += int64(n + 2)
 		}
 		// finished reading the command
@@ -919,7 +919,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		if len(parts) == 0 {
 			continue
 		}
-		if (parts[0][0] == 's' || parts[0][0] == 'S') &&
+		if len(parts[0]) >= 3 &&
+			(parts[0][0] == 's' || parts[0][0] == 'S') &&
 			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
 			(parts[0][2] == 't' || parts[0][2] == 'T') {
 			// SET
@@ -960,7 +961,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			} else {
 				db.insertIntoDatabase(&dbItem{key: parts[1], val: parts[2]})
 			}
-		} else if (parts[0][0] == 'd' || parts[0][0] == 'D') &&
+		} else if len(parts[0]) >= 3 &&
+			(parts[0][0] == 'd' || parts[0][0] == 'D') &&
 			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
 			(parts[0][2] == 'l' || parts[0][2] == 'L') {
 			// DEL
@@ -968,7 +970,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 				return totalSize, ErrInvalid
 			}
 			db.deleteFromDatabase(&dbItem{key: parts[1]})
-		} else if (parts[0][0] == 'f' || parts[0][0] == 'F') &&
+		} else if len(parts[0]) > 0 &&
+			(parts[0][0] == 'f' || parts[0][0] == 'F') &&
 			strings.ToLower(parts[0]) == "flushdb" {
 			db.keys = btreeNew(lessCtx(nil))
 			db.exps = btreeNew(lessCtx(&exctx{db}))
