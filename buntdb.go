@@ -803,6 +803,27 @@ func renameFile(src, dest string) error {
 	return err
 }
 
+// parseRESPInt parses the decimal integer in a RESP count line. The line
+// includes its trailing CRLF. Overflow is invalid instead of wrapping.
+func parseRESPInt(line []byte) (int, error) {
+	if len(line) < 4 || line[len(line)-2] != '\r' || line[len(line)-1] != '\n' {
+		return 0, ErrInvalid
+	}
+	n := 0
+	maxInt := int(^uint(0) >> 1)
+	for i := 1; i < len(line)-2; i++ {
+		if line[i] < '0' || line[i] > '9' {
+			return 0, ErrInvalid
+		}
+		digit := int(line[i] - '0')
+		if n > (maxInt-digit)/10 {
+			return 0, ErrInvalid
+		}
+		n = n*10 + digit
+	}
+	return n, nil
+}
+
 // readLoad reads from the reader and loads commands into the database.
 // modTime is the modified time of the reader, should be no greater than
 // the current time.Now().
@@ -848,23 +869,10 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		}
 		cmdByteSize += int64(len(line))
 
-		// convert the string number to and int
-		var n int
-		if len(line) == 4 && line[len(line)-2] == '\r' {
-			if line[1] < '0' || line[1] > '9' {
-				return totalSize, ErrInvalid
-			}
-			n = int(line[1] - '0')
-		} else {
-			if len(line) < 5 || line[len(line)-2] != '\r' {
-				return totalSize, ErrInvalid
-			}
-			for i := 1; i < len(line)-2; i++ {
-				if line[i] < '0' || line[i] > '9' {
-					return totalSize, ErrInvalid
-				}
-				n = n*10 + int(line[i]-'0')
-			}
+		// convert the string number to an int
+		n, err := parseRESPInt(line)
+		if err != nil {
+			return totalSize, err
 		}
 		// read each part of the command.
 		parts = parts[:0]
@@ -878,28 +886,24 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 				return totalSize, ErrInvalid
 			}
 			cmdByteSize += int64(len(line))
-			// convert the string number to and int
-			var n int
-			if len(line) == 4 && line[len(line)-2] == '\r' {
-				if line[1] < '0' || line[1] > '9' {
-					return totalSize, ErrInvalid
-				}
-				n = int(line[1] - '0')
-			} else {
-				if len(line) < 5 || line[len(line)-2] != '\r' {
-					return totalSize, ErrInvalid
-				}
-				for i := 1; i < len(line)-2; i++ {
-					if line[i] < '0' || line[i] > '9' {
-						return totalSize, ErrInvalid
-					}
-					n = n*10 + int(line[i]-'0')
-				}
+			// convert the string number to an int
+			n, err := parseRESPInt(line)
+			if err != nil {
+				return totalSize, err
 			}
-			// resize the read buffer
+			// resize the read buffer. Reject sizes whose addition or growth
+			// would overflow int before attempting to allocate them.
+			maxInt := int(^uint(0) >> 1)
+			if n > maxInt-2 {
+				return totalSize, ErrInvalid
+			}
 			if len(data) < n+2 {
 				dataln := len(data)
 				for dataln < n+2 {
+					if dataln > maxInt/2 {
+						dataln = n + 2
+						break
+					}
 					dataln *= 2
 				}
 				data = make([]byte, dataln)
@@ -919,9 +923,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		if len(parts) == 0 {
 			continue
 		}
-		if (parts[0][0] == 's' || parts[0][0] == 'S') &&
-			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
-			(parts[0][2] == 't' || parts[0][2] == 'T') {
+		cmd := strings.ToLower(parts[0])
+		if cmd == "set" {
 			// SET
 			if len(parts) < 3 || len(parts) == 4 || len(parts) > 5 {
 				return totalSize, ErrInvalid
@@ -960,16 +963,13 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			} else {
 				db.insertIntoDatabase(&dbItem{key: parts[1], val: parts[2]})
 			}
-		} else if (parts[0][0] == 'd' || parts[0][0] == 'D') &&
-			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
-			(parts[0][2] == 'l' || parts[0][2] == 'L') {
+		} else if cmd == "del" {
 			// DEL
 			if len(parts) != 2 {
 				return totalSize, ErrInvalid
 			}
 			db.deleteFromDatabase(&dbItem{key: parts[1]})
-		} else if (parts[0][0] == 'f' || parts[0][0] == 'F') &&
-			strings.ToLower(parts[0]) == "flushdb" {
+		} else if cmd == "flushdb" {
 			db.keys = btreeNew(lessCtx(nil))
 			db.exps = btreeNew(lessCtx(&exctx{db}))
 			db.idxs = make(map[string]*index)
